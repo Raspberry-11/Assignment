@@ -1,0 +1,165 @@
+# DA331 Assignment 2 — Sensing People in Sparse Signals (DROW v2)
+
+Person detection in 2-D laser range data: ingestion and validation of the raw DROW v2
+release, exploratory analysis, a distance-normalised cutout representation, a random-forest
+detector with three baselines, and a pre-registered experiment on the train→test aisle shift.
+
+**Deliverables:** [`notebook.ipynb`](notebook.ipynb) (the main artefact) and
+[`report.md`](report.md). The dataset itself is **not** included, as required.
+
+---
+
+## Getting it to run
+
+1. **Data.** Download `DROWv2-data.zip` (~189 MB) from the Releases page of
+   <https://github.com/VisualComputingInstitute/DROW> and extract it so that this exists:
+
+   ```
+   data/DROWv2-data/{train,val,test}/
+   ```
+
+   If you put it elsewhere, edit the single line `DATA_ROOT` in `config.py`. On Windows use
+   a raw string: `Path(r"C:\...\DROWv2-data")`.
+
+2. **Environment.** Python 3.10–3.12 and a JDK (17 or 21) on `PATH` for PySpark.
+
+   ```bash
+   pip install -r requirements.txt
+   java -version          # must print 17 or 21
+   ```
+
+   `pandas` is pinned below 3.0 deliberately: PySpark 4.2 emits a compatibility warning on
+   every `toPandas()` call otherwise.
+
+3. **Run.** Open `notebook.ipynb` and use **Kernel → Restart and Run All**. Nothing depends
+   on execution order, and every random draw goes through `config.SEED`.
+
+### Runtime and resources
+
+Measured end to end on an M3 MacBook Air, CPU only: about **45 minutes** for a cold
+restart-and-run-all, and about 40 minutes once `cache/` exists. Roughly 80% of that is
+fitting the twelve random forests (three representations, five subsampling ratios, four
+Part E arms); Part A's Spark work is only a few minutes of it.
+
+No GPU is used or needed. Peak memory is around 2 GB, dominated by the per-beam evaluation
+matrices — evaluation deliberately scores *every* candidate beam of every annotated frame
+rather than a subsample, because a PR curve computed on subsampled negatives reports a
+precision that does not exist.
+
+`cache/` and `figures/` are generated and gitignored. Deleting `cache/` forces a clean
+rebuild from `data/`.
+
+---
+
+## Layout
+
+```
+config.py              single source of paths, sensor constants, seed, and every
+                       hyper-parameter — the one file to edit when moving machines
+notebook.ipynb         the deliverable; thin, imports from src/
+report.md              the 2–3 page write-up
+src/
+  io.py                Part A: Spark ingestion, schema forensics, sentinel audit,
+                       odometry-join evidence, Parquet cache with measured I/O
+  labels.py            label parsing, the three-state frame index, beam geometry
+  features.py          three representations + jump-distance segmentation
+  dataset.py           cache → numpy; per-beam example construction
+  evaluate.py          NMS, matching, PR/AP, baselines, latency and memory budgets
+  shift.py             Part E: discriminator, augmentations, attribution
+  viz.py               plotting helpers
+figures/               written by the notebook (gitignored)
+cache/                 Parquet + .npz bundles (gitignored, NOT submitted)
+data/                  place DROWv2-data here (gitignored, NOT submitted)
+```
+
+Logic lives in `src/`, not in cells. That is what makes restart-and-run-all safe and keeps
+the notebook to 54 code cells whose output is the point.
+
+---
+
+## Design decisions, and where they are defended
+
+| Decision | Where |
+|---|---|
+| **Persons only** (`.wp`); wheelchairs and walking aids stay in as hard negatives | B3 |
+| **Spark for the 208M readings, NumPy/sklearn for the labelled 5%** | A6, A7, B0 |
+| **Random forest**, not a CNN — interpretable in physical coordinates, which Part E needs | C, D4 |
+| **Distance-normalised cutouts**, compared against a fixed-beam control and the Arras 2007 descriptors | C |
+| **Split by recording, never by frame** | B1 |
+| **Average precision, distance-matched, stratified by range** — not accuracy | D2, D6 |
+| **Negative subsampling 10:1 in training only**, with the ratio swept | C, D5 |
+
+## Three things that are enforced structurally, not by convention
+
+1. **The three-state frame index.** For every (frame, class): annotated-positive,
+   annotated-empty, or never-annotated. A never-annotated frame is never used as a negative;
+   `labels.frame_states()` makes the distinction impossible to lose (B0, B4).
+2. **Evaluation never subsamples.** Training uses `negative_ratio=10`; every evaluation call
+   passes `negative_ratio=None` (C, D).
+3. **Test-set discipline.** Every read of the test split goes through `touch_test()`, which
+   prints and counts it (the total is 4). Part D touches test once, after all decisions are
+   frozen. Part E is an experiment *about* the train→test gap, so it necessarily measures on
+   test — the discipline that replaces "touch it once" is pre-registration: hypothesis, all
+   four arms and the decision rule are written down before the cells run, every arm's
+   parameters come from `config.py`, and every arm that was run is reported.
+
+## Headline results
+
+| | |
+|---|---|
+| Random forest on cutouts, val AP | **0.287** (peak F1 0.348) |
+| Same model, test AP | **0.401** |
+| Geometric-rule baseline / random / all-negative | 0.037 / 0.028 / 0.000 |
+| Representation: cutout / fixed window / Arras 2007 | 0.287 / 0.221 / 0.219 |
+| Online cost | 13.7 ms per frame against a measured 78.7 ms budget |
+
+**Part E returns a negative result, and that is the intended outcome.** The registered
+hypothesis was that the train→test drop is driven by background corridor geometry. There is no
+drop: the detector scores *higher* on the test aisle. The shift is real (discriminator AUC
+0.980 against 0.689 for the same-aisle control) but it made the test split easier, not harder,
+because that corridor is closer and cleaner. The E4 cell checks that premise before scoring the
+three legs, so it reports a mis-specified hypothesis rather than three green ticks for an
+explanation of nothing. What survives is that the model does lean on background (blanking the
+cutout flanks costs ~0.04 AP on both splits) and that the untargeted mirror control beats both
+targeted augmentations.
+
+## Findings that contradict the documentation
+
+All three were re-derived from the bytes on disk, and the evidence is in the notebook:
+
+- **Scan CSVs have 452 fields, not the documented 451.** The layout is
+  `seq, time_seconds, r_0 … r_449`. No released file matches the README and none is ragged.
+  Field 1 is a relative timestamp, not a range — treating it as beam 0 silently rotates the
+  entire angular axis by half a degree (A2).
+- **`.odom2` sequence numbers do not share a numbering space with scan sequence numbers.**
+  Row counts match recording-for-recording, but the sequence overlap is zero. Join on
+  `time_s`, never on `seq`; `io.load_odometry` names the column `odom_seq` so that a careless
+  join raises instead of quietly returning nothing (A5).
+
+- **Bearing increases with beam index, so beam 0 is the rightmost beam** — the opposite of
+  what the brief states. B2 scores both conventions by whether an annotated person lands on a
+  beam whose measured range matches the annotated range: the increasing convention agrees on
+  the exact beam 74.2% of the time, the documented one 10.5%, which is chance. This one is
+  worth dwelling on, because the first executed run of this notebook adopted the documented
+  convention. It mirrors every annotation to the opposite side of the corridor while leaving
+  every cell running without error, and the only symptom was that annotated persons had a
+  median of zero beams on them and the detector scored AP 0.008.
+
+Also worth knowing: 29.96 is the missing-return sentinel but is **not** the maximum value (98
+distinct values sit above 29.0 m in val, the largest 29.99), so `range > 29` is the wrong
+filter — `features.missing_mask` tests membership in an exact set of values (A3). And one val
+recording (`run_2015-11-25-11-18-12-d.bag`) has label files but no scan file, no person labels
+and no odometry (A1).
+
+## Citations
+
+L. Beyer\*, A. Hermans\*, B. Leibe, *DROW: Real-Time Deep Learning based Wheelchair Detection
+in 2D Range Data*, IEEE RA-L 2(2):585–592, 2017, <https://arxiv.org/abs/1603.02636>.
+L. Beyer, A. Hermans, T. Linder, K. O. Arras, B. Leibe, *Deep Person Detection in 2D Range
+Data*, IEEE RA-L 3(3):2726–2733, 2018, <https://arxiv.org/abs/1804.02463>.
+K. O. Arras, O. M. Mozos, W. Burgard, *Using Boosted Features for the Detection of People in
+2D Range Data*, ICRA 2007 (classical feature set used as a representation control).
+
+**Licence.** DROWv2-data is MIT-licensed except the `reha` subset (CC-BY-NC-SA 3.0). A1
+checks the released basenames and finds none from `reha`, so this analysis is entirely under
+MIT. The dataset is not redistributed here.
