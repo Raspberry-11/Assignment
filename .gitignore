@@ -12,6 +12,12 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 .DS_Store
+.venv/
+
+# Local Windows winutils.exe shim for PySpark, and Claude Code session state.
+# Neither belongs in the submission.
+hadoop/
+.claude/
 
 # Internal working brief, not a deliverable.
 CLAUDE.md

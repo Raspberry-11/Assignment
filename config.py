@@ -69,8 +69,13 @@ TARGET_CLASS = "wp"
 # --------------------------------------------------------------------------
 # Spark
 # --------------------------------------------------------------------------
-SPARK_DRIVER_MEMORY = "4g"
-SPARK_SHUFFLE_PARTITIONS = 16
+# 4g/16 partitions was enough on the development machine but ran the driver out
+# of heap on a 16GB Windows laptop with ~5GB free, on the full-corpus posexplode
+# in B1 (450x row inflation over 208M readings, shuffled into only 16 pieces).
+# More, smaller shuffle partitions plus headroom fixes it without needing a
+# cluster; still a laptop-sized number, not a production default.
+SPARK_DRIVER_MEMORY = "6g"
+SPARK_SHUFFLE_PARTITIONS = 64
 
 # --------------------------------------------------------------------------
 # Labelling (Part B/C)
